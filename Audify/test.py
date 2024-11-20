@@ -3,8 +3,17 @@ import warnings
 import torch
 from censor import censor_audio
 from pydub import AudioSegment
-import os 
+import os
 from moviepy.editor import VideoFileClip, AudioFileClip
+from flask_cors import CORS
+import os
+os.environ["FFMPEG_BINARY"] = "/opt/homebrew/bin/ffmpeg"  # Correct path to ffmpeg
+from moviepy.config import get_setting
+# Set the ffmpeg binary path in the environment before importing MoviePy
+os.environ["FFMPEG_BINARY"] = "/opt/homebrew/bin/ffmpeg"  # Correct path to ffmpeg
+# Now print out the ffmpeg binary location
+print(f"Using ffmpeg from: {get_setting('FFMPEG_BINARY')}")
+import moviepy.editor as mp
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -12,16 +21,23 @@ warnings.filterwarnings("ignore", message="FP16 is not supported on CPU")
 warnings.filterwarnings("ignore", category=UserWarning, module="whisper")
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
 
+# Set ffmpeg path if needed
+ffmpeg_path = "/opt/homebrew/bin/ffmpeg"  # Change this to your ffmpeg path if different
+mp.ffmpeg_tools.ffmpeg_binary = "/opt/homebrew/bin/ffmpeg"  # Ensure moviepy knows where ffmpeg is
+
 print(torch.cuda.is_available())
 if torch.cuda.is_available():
-    print(torch.cuda.get_device_name(0))  
+    print(torch.cuda.get_device_name(0))
 
 app = Flask(__name__)
 
-base_audio_path = r"Media\extracted_audio.wav"
-censor_audio_path = r"Media\overlay_audio.wav"
-output_audio_path = r"Media\output_audio.wav"
-output_video_path = r"Media\output_video_with_censored_audio.mp4"
+# Enable CORS for all routes
+CORS(app,origins=["http://localhost:3000"])
+
+base_audio_path = r"Media/extracted_audio.wav"
+censor_audio_path = r"Media/overlay_audio.wav"
+output_audio_path = r"Media/output_audio.wav"
+output_video_path = r"Media/output_video_with_censored_audio.mp4"
 
 model_name = 'small'
 to_censor = ["kill", "killed", "fuck", "fucking", "killing"]
@@ -39,15 +55,23 @@ def upload_audio():
         return jsonify({"error": "Missing 'base' audio file."}), 400
 
     base_audio = request.files['base']
-    base_audio.save("temp_base_audio")  
-    convert_to_wav("temp_base_audio", base_audio_path)  
-    os.remove("temp_base_audio")
+    print(f"Received base audio: {base_audio.filename}")
+
+    try:
+        base_audio.save("temp_base_audio")
+        convert_to_wav("temp_base_audio", base_audio_path)  
+        os.remove("temp_base_audio")
+    except Exception as e:
+        return jsonify({"error": f"Error processing audio file: {str(e)}"}), 500
 
     overlay_audio = request.files.get('overlay')
     if overlay_audio and overlay_audio.filename:
-        overlay_audio.save("temp_overlay_audio")  
-        convert_to_wav("temp_overlay_audio", censor_audio_path)
-        os.remove("temp_overlay_audio")
+        try:
+            overlay_audio.save("temp_overlay_audio")  
+            convert_to_wav("temp_overlay_audio", censor_audio_path)
+            os.remove("temp_overlay_audio")
+        except Exception as e:
+            return jsonify({"error": f"Error processing overlay audio: {str(e)}"}), 500
 
     censor_words = request.form.get('censor_words')
     if censor_words:
@@ -62,9 +86,10 @@ def upload_audio():
 
 @app.route('/censor', methods=['GET'])
 def censor_get():
-    if not base_audio_path:
+    if not os.path.exists(base_audio_path):  # Ensure the base audio exists
         return jsonify({"error": "Base audio file not found. Please upload first."}), 404
 
+    # Perform censorship
     censor_audio(
         base_audio_path=base_audio_path,
         censor_audio_path=censor_audio_path,
@@ -75,9 +100,12 @@ def censor_get():
         gain_of_base=-100,
         silent=False
     )
-    print('Censoring done')
-    return send_file(output_audio_path, mimetype='audio/wav')
 
+    # Check if censored audio exists
+    if os.path.exists(output_audio_path):
+        return send_file(output_audio_path, mimetype='audio/wav')
+    else:
+        return jsonify({"error": "Censorship failed, no output audio found."}), 500
 
 
 def censor_audio_from_video(input_video_path, output_video_path, to_censor):
@@ -86,11 +114,11 @@ def censor_audio_from_video(input_video_path, output_video_path, to_censor):
     audio = video.audio
     audio_path = "temp_audio.wav"
     audio.write_audiofile(audio_path)
-    
+
     # Convert the extracted audio to .wav format
     convert_to_wav(audio_path, base_audio_path)
     os.remove(audio_path)
-    
+
     # Perform the censorship on the audio
     censor_audio(
         base_audio_path=base_audio_path,
@@ -102,7 +130,7 @@ def censor_audio_from_video(input_video_path, output_video_path, to_censor):
         gain_of_base=-100,
         silent=False
     )
-    
+
     # Replace the original audio with the censored audio in the video
     censored_audio = AudioFileClip(output_audio_path)
     final_video = video.set_audio(censored_audio)
@@ -111,6 +139,7 @@ def censor_audio_from_video(input_video_path, output_video_path, to_censor):
     # Clean up
     video.close()
     censored_audio.close()
+
 
 @app.route('/upload_video', methods=['POST'])
 def upload_video():
@@ -128,7 +157,7 @@ def upload_video():
             to_censor = censor_words.split(",") 
         except Exception as e:
             return jsonify({"error": f"Invalid censor words format: {str(e)}"}), 400
-    print(to_censor)
+    
     # Process the video to extract audio, censor it, and put it back
     try:
         censor_audio_from_video(video_path, output_video_path, to_censor)
@@ -140,6 +169,7 @@ def upload_video():
         os.remove(video_path)
 
     return jsonify({"message": "Video uploaded and processed successfully."}), 200
+
 
 @app.route('/get_video', methods=['GET'])
 def get_video():
@@ -205,6 +235,7 @@ def upload_video_page():
     </body>
     </html>
     '''
+
 
 if __name__ == '__main__':
     app.run(debug=True)
